@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -17,6 +17,7 @@ type Quality = "low" | "medium" | "high" | "very-high" | "maximum";
 type Settings = { format: Format; unit: Unit; width: number | null; height: number | null; ppi: number; resizeMode: ResizeMode; cropAnchor: CropAnchor; quality: Quality };
 type ItemResult = { source: string; output?: string; error?: string };
 type Summary = { completed: ItemResult[]; failed: ItemResult[] };
+type PreviewResponse = { path: string; cacheHit: boolean };
 const formats: Format[] = ["jpeg", "png", "webp", "gif"];
 const formatLabel: Record<Format, string> = { jpeg: "JPEG", png: "PNG", webp: "WebP", gif: "GIF" };
 const baseSettings: Settings = { format: "jpeg", unit: "px", width: null, height: null, ppi: 150, resizeMode: "contain", cropAnchor: "center", quality: "high" };
@@ -42,6 +43,7 @@ function App() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [theme, setTheme] = useState<Theme>(() => localStorage.getItem("coverdrop-theme") === "dark" ? "dark" : "light");
   const [helpOpen, setHelpOpen] = useState(false);
+  const previewRequestId = useRef(0);
   const queue = mode === "files" ? files : folderFiles;
   const ready = Boolean(outputDir && queue.length);
   const activeIndex = Math.max(0, queue.indexOf(activeFile));
@@ -58,15 +60,30 @@ function App() {
   }, []);
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem("coverdrop-theme", theme); }, [theme]);
   useEffect(() => {
-    if (!activeFile) { setPreview(""); return; }
+    if (!activeFile) { setPreview(""); setPreviewLoading(false); return; }
+    const requestId = ++previewRequestId.current;
     setPreviewLoading(true); setPreview("");
     let cancelled = false;
-    invoke<string>("get_pdf_preview", { path: activeFile })
-      .then((image) => { if (!cancelled) setPreview(image); })
-      .catch((error) => { if (!cancelled) showError("Preview", error); })
+    invoke<PreviewResponse>("get_pdf_preview", { path: activeFile, requestId, prefetch: false })
+      .then((result) => {
+        if (cancelled) return;
+        setPreview(convertFileSrc(result.path));
+        const index = queue.indexOf(activeFile);
+        const neighbors = [queue[index + 1], queue[index - 1]].filter(Boolean);
+        void (async () => {
+          for (const path of neighbors) {
+            try {
+              const prefetchId = ++previewRequestId.current;
+              const prefetched = await invoke<PreviewResponse>("get_pdf_preview", { path, requestId: prefetchId, prefetch: true });
+              const image = new window.Image(); image.src = convertFileSrc(prefetched.path);
+            } catch { /* Preloading is opportunistic and never blocks the active preview. */ }
+          }
+        })();
+      })
+      .catch((error) => { if (!cancelled && !String(error).includes("cancelled")) showError("Preview", error); })
       .finally(() => { if (!cancelled) setPreviewLoading(false); });
-    return () => { cancelled = true; };
-  }, [activeFile]);
+    return () => { cancelled = true; void invoke("cancel_pdf_preview", { requestId }); };
+  }, [activeFile, queue]);
   useEffect(() => { if (queue.length && !queue.includes(activeFile)) setActiveFile(queue[0]); if (!queue.length) setActiveFile(""); }, [queue, activeFile]);
 
   async function chooseFiles(append = false) {

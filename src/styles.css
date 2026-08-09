@@ -10,6 +10,14 @@ footer { grid-column: 1 / -1; display: flex; align-items: center; justify-conten
 @media (max-width: 860px) { .studio { display: block; padding: 12px; }.sidebar, .preview-column, .inspector { margin-bottom: 12px; border-radius: 14px; }.sidebar { min-height: auto; }.sidebar-bottom { display: none; }.stepper { grid-template-columns: repeat(3, 1fr); padding: 0 0 18px; }.stepper button:not(:last-child)::after { display: none; }.queue-list { max-height: 250px; }.preview-column { min-height: 570px; }.inspector { min-height: 600px; } footer { height: 38px; border: 0; } }
 
 /* The preview header follows the export settings heading pattern. */
+.summary, .summary.has-errors { border-color: var(--line); background: var(--surface-muted); color: var(--text); }
+.quality-resolution-row { display: grid; grid-template-columns: 1.1fr .9fr; gap: 12px; margin-bottom: 18px; }
+.quality-resolution-row label { display: grid; gap: 8px; min-width: 0; color: var(--text); font-size: 12px; font-weight: 600; }
+.quality-resolution-row select:disabled { cursor: not-allowed; color: var(--muted); opacity: .7; }
+.result-dialog { width: min(420px, 100%); }
+.result-icon { display: grid; flex: none; place-items: center; width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-muted); color: var(--text); }
+.result-message { margin: 22px 0 18px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-muted); color: var(--text); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+
 .brand { margin-bottom: 22px; }
 .preview-header { min-height: 42px; height: auto; font-size: inherit; }
 .preview-heading { display: flex; align-items: flex-start; gap: 9px; color: var(--primary); }

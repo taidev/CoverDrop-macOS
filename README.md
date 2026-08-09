@@ -1,6 +1,6 @@
 # CoverDrop-macOS
 
-CoverDrop-macOS is a local Mac desktop app that turns the first page of one or more PDF files into website-ready cover images.
+CoverDrop for macOS turns the first page of any PDF into a website-ready cover image, right on your Mac.
 
 ![CoverDrop desktop app showing a selected PDF, cover preview, and export settings](docs/coverdrop-screenshot.png)
 

@@ -1,8 +1,14 @@
-# CoverDrop
+# CoverDrop-macOS
 
-CoverDrop is a local desktop app that turns the first page of one or more PDF files into website-ready cover images.
+CoverDrop-macOS is a local Mac desktop app that turns the first page of one or more PDF files into website-ready cover images.
 
 ![CoverDrop desktop app showing a selected PDF, cover preview, and export settings](docs/coverdrop-screenshot.png)
+
+## Download
+
+[Download CoverDrop 1.0.0 for Apple Silicon macOS](downloads/coverDrop_1.0.0.dmg)
+
+You can also download it from the [CoverDrop 1.0.0 release](https://github.com/taidev/CoverDrop-macOS/releases/tag/v1.0.0). This build is ad-hoc signed but not Apple-notarized, so macOS may require you to Control-click the app and choose **Open** the first time. Intel Macs are not currently supported.
 
 ## Features
 
@@ -15,9 +21,9 @@ CoverDrop is a local desktop app that turns the first page of one or more PDF fi
 - Process files locally without intentionally uploading PDF contents.
 - Use light and dark themes.
 
-## Supported platforms
+## Supported platform
 
-The application source supports macOS and Windows. Release packaging requires a complete, native Poppler renderer bundle for the target platform. Renderer binaries are deliberately not committed to this source repository.
+This repository is for Apple Silicon macOS. The Windows edition will be maintained as a separate project. Release packaging requires a complete, native Poppler renderer bundle. Standalone renderer binaries are deliberately not committed to this source repository.
 
 ## Development
 
@@ -39,11 +45,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 CoverDrop ships Poppler as a platform-specific renderer. Release builds refuse to continue when the matching renderer is missing, preventing an installer that cannot generate covers.
 
-Expected renderer locations:
+Expected macOS renderer locations:
 
 - Apple Silicon macOS: `src-tauri/binaries/macos-aarch64/pdftoppm`
 - Intel macOS: `src-tauri/binaries/macos-x86_64/pdftoppm`
-- 64-bit Windows: `src-tauri/binaries/windows-x86_64/bin/pdftoppm.exe` plus its required DLLs
 
 Build an Apple Silicon macOS disk image with:
 
@@ -51,13 +56,7 @@ Build an Apple Silicon macOS disk image with:
 npm run tauri build -- --bundles dmg
 ```
 
-Build a 64-bit Windows NSIS installer on Windows with:
-
-```powershell
-npm run tauri build -- --bundles nsis --target x86_64-pc-windows-msvc
-```
-
-Public macOS releases should be signed and notarized with an Apple Developer ID. Public Windows releases should be Authenticode-signed. Before distributing an installer, document and satisfy the source and notice obligations for Poppler and every library in the renderer bundle; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Public macOS releases should be signed and notarized with an Apple Developer ID. Before distributing an installer, document and satisfy the source and notice obligations for Poppler and every library in the renderer bundle; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Privacy
 

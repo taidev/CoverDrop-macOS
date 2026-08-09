@@ -6,7 +6,7 @@ Dependency names and versions for source dependencies are recorded in `package-l
 
 ## Poppler renderer
 
-The source repository does not distribute platform-specific Poppler executables or dynamic libraries. Developers provide a local `pdftoppm` installation for development. Release maintainers may place a complete, platform-native renderer bundle under `src-tauri/binaries/<platform>-<architecture>/` before packaging.
+The source tree does not distribute standalone platform-specific Poppler executables or dynamic libraries. Developers provide a local `pdftoppm` installation for development. Release maintainers may place a complete, platform-native renderer bundle under `src-tauri/binaries/<platform>-<architecture>/` before packaging. Published application installers may contain that renderer bundle and its license notices.
 
 Poppler is licensed under GPL version 2 or GPL version 3. Any public installer containing Poppler must include the applicable license notices and provide the exact corresponding source, build information, and notices required by the licenses of Poppler and its bundled libraries.
 

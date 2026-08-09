@@ -1,14 +1,16 @@
-# CoverDrop-macOS
+# CoverDrop for macOS
 
-CoverDrop for macOS turns the first page of any PDF into a website-ready cover image, right on your Mac.
+CoverDrop is a privacy-friendly macOS desktop app that turns the first page of any PDF into a website-ready cover image, right on your Mac.
+
+[![Download CoverDrop 1.0.0](https://img.shields.io/badge/Download-CoverDrop%201.0.0-006bde?style=for-the-badge&logo=apple)](downloads/CoverDrop_macOS_1.0.0.dmg)
 
 ![CoverDrop desktop app showing a selected PDF, cover preview, and export settings](docs/coverdrop-screenshot.png)
 
 ## Download
 
-[Download CoverDrop 1.0.0 for Apple Silicon macOS](downloads/CoverDrop_macOS_1.0.0.dmg)
+[Download CoverDrop 1.0.0 for Apple Silicon macOS](downloads/CoverDrop_macOS_1.0.0.dmg), or view the [GitHub release](https://github.com/taidev/CoverDrop-macOS/releases/tag/v1.0.0) for release details.
 
-You can also download it from the [CoverDrop 1.0.0 release](https://github.com/taidev/CoverDrop-macOS/releases/tag/v1.0.0). This build is ad-hoc signed but not Apple-notarized, so macOS may require you to Control-click the app and choose **Open** the first time. Intel Macs are not currently supported.
+This build is ad-hoc signed but not Apple-notarized. On first launch, macOS may require you to Control-click the app and choose **Open**.
 
 ## Features
 
@@ -23,7 +25,7 @@ You can also download it from the [CoverDrop 1.0.0 release](https://github.com/t
 
 ## Supported platform
 
-This repository is for Apple Silicon macOS. The Windows edition will be maintained as a separate project. Release packaging requires a complete, native Poppler renderer bundle. Standalone renderer binaries are deliberately not committed to this source repository.
+This repository is for Apple Silicon Macs. Intel Macs are not currently supported. The Windows edition is maintained separately in [CoverDrop-Windows](https://github.com/taidev/CoverDrop-Windows). Release packaging requires a complete, native Poppler renderer bundle. Standalone renderer binaries are deliberately not committed to this source repository.
 
 ## Development
 

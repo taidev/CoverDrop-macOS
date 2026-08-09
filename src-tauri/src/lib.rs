@@ -1,15 +1,20 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use image::{codecs::jpeg::JpegEncoder, DynamicImage, ImageEncoder, ImageFormat};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     fs,
     io::Cursor,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -19,7 +24,14 @@ const MAX_OUTPUT_DIMENSION: u32 = 10_000;
 const MAX_OUTPUT_PIXELS: u64 = 40_000_000;
 const MAX_RENDER_SECONDS: u64 = 90;
 const MAX_RENDER_SIDE: u32 = 8_000;
+const PREVIEW_RENDER_SIDE: u32 = 1_400;
+const PREVIEW_JPEG_QUALITY: u8 = 82;
+const PREVIEW_CACHE_VERSION: &str = "v1";
+const PREVIEW_CACHE_MAX_FILES: usize = 256;
+const PREVIEW_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const MAX_BATCH_FILES: usize = 10_000;
+const MAX_EXPORT_WORKERS: usize = 2;
+const MIN_CUSTOM_RENDER_SIDE: u32 = 256;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +87,25 @@ struct Progress {
     current: usize,
     total: usize,
     file: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewResponse {
+    path: String,
+    cache_hit: bool,
+}
+
+#[derive(Clone)]
+struct PreviewJob {
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct PreviewState {
+    active: Mutex<Option<PreviewJob>>,
+    cache_pruned: AtomicBool,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -176,7 +207,7 @@ fn output_extension(format: &str) -> Result<&'static str, String> {
         _ => Err("Unsupported image format".into()),
     }
 }
-fn unique_output(dir: &Path, stem: &str, extension: &str) -> PathBuf {
+fn reserve_output(dir: &Path, stem: &str, extension: &str) -> Result<PathBuf, String> {
     let mut n = 1;
     loop {
         let suffix = if n == 1 {
@@ -185,10 +216,15 @@ fn unique_output(dir: &Path, stem: &str, extension: &str) -> PathBuf {
             format!("-{n}")
         };
         let candidate = dir.join(format!("{stem}{suffix}.{extension}"));
-        if !candidate.exists() {
-            return candidate;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(error) => return Err(format!("Could not reserve the output file: {error}")),
         }
-        n += 1;
     }
 }
 fn renderer(app: &AppHandle) -> Result<PathBuf, String> {
@@ -231,64 +267,236 @@ impl Drop for RenderedPage {
         let _ = fs::remove_dir_all(&self.temp_dir);
     }
 }
-fn render_first_page(app: &AppHandle, source: &Path, ppi: f64) -> Result<RenderedPage, String> {
+#[derive(Clone, Copy)]
+enum RenderFormat {
+    Png,
+    Jpeg(u8),
+}
+
+fn render_first_page(
+    app: &AppHandle,
+    source: &Path,
+    ppi: f64,
+    render_side: Option<u32>,
+    format: RenderFormat,
+    cancelled: Option<&AtomicBool>,
+) -> Result<RenderedPage, String> {
     let temp = std::env::temp_dir().join(format!("coverdrop-{}", Uuid::new_v4()));
     fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
     let prefix = temp.join("page");
     let ppi = ppi.round().clamp(72.0, 300.0).to_string();
-    let max_render_side = MAX_RENDER_SIDE.to_string();
-    let mut child = Command::new(renderer(app)?)
-        .args([
-            "-f",
-            "1",
-            "-l",
-            "1",
-            "-singlefile",
-            "-png",
-            "-r",
-            &ppi,
-            "-scale-to",
-            &max_render_side,
-        ])
-        .arg(source)
-        .arg(&prefix)
-        .spawn()
-        .map_err(|e| format!("Could not start the PDF renderer: {e}"))?;
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("Could not monitor the PDF renderer: {e}"))?
-        {
-            break status;
+    let mut command = Command::new(renderer(app)?);
+    command.args(["-f", "1", "-l", "1", "-singlefile"]);
+    match format {
+        RenderFormat::Png => {
+            command.arg("-png");
         }
-        if started.elapsed() >= Duration::from_secs(MAX_RENDER_SECONDS) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("The PDF renderer timed out after 90 seconds.".into());
+        RenderFormat::Jpeg(quality) => {
+            command.args([
+                "-jpeg",
+                "-jpegopt",
+                &format!("quality={quality},optimize=y"),
+            ]);
         }
-        thread::sleep(Duration::from_millis(50));
-    };
-    if !status.success() {
-        return Err("The PDF could not be rendered. It may be encrypted or damaged.".into());
     }
-    let png = temp.join("page.png");
-    if png.exists() {
-        Ok(RenderedPage {
-            path: png,
-            temp_dir: temp,
+    let render_side = render_side.map(|value| value.to_string());
+    let result = (|| -> Result<RenderedPage, String> {
+        command.args(["-r", &ppi]);
+        if let Some(render_side) = render_side.as_deref() {
+            command.args(["-scale-to", render_side]);
+        }
+        let mut child = command
+            .arg(source)
+            .arg(&prefix)
+            .spawn()
+            .map_err(|e| format!("Could not start the PDF renderer: {e}"))?;
+        let started = Instant::now();
+        let status = loop {
+            if cancelled.is_some_and(|token| token.load(Ordering::Relaxed)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Preview cancelled.".into());
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| format!("Could not monitor the PDF renderer: {e}"))?
+            {
+                break status;
+            }
+            if started.elapsed() >= Duration::from_secs(MAX_RENDER_SECONDS) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("The PDF renderer timed out after 90 seconds.".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        if !status.success() {
+            return Err("The PDF could not be rendered. It may be encrypted or damaged.".into());
+        }
+        let rendered = temp.join(match format {
+            RenderFormat::Png => "page.png",
+            RenderFormat::Jpeg(_) => "page.jpg",
+        });
+        if rendered.exists() {
+            Ok(RenderedPage {
+                path: rendered,
+                temp_dir: temp.clone(),
+            })
+        } else {
+            Err("The PDF has no renderable first page.".into())
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    result
+}
+
+fn preview_cache_path(app: &AppHandle, source: &Path) -> Result<PathBuf, String> {
+    let canonical = source.canonicalize().map_err(|e| e.to_string())?;
+    let metadata = canonical.metadata().map_err(|e| e.to_string())?;
+    let modified = metadata
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(PREVIEW_CACHE_VERSION.as_bytes());
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified.as_nanos().to_le_bytes());
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("previews");
+    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+    Ok(cache_dir.join(format!("{:x}.jpg", hasher.finalize())))
+}
+
+fn prune_preview_cache(app: &AppHandle) {
+    let Ok(cache_dir) = app.path().app_cache_dir().map(|path| path.join("previews")) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if now.duration_since(modified).unwrap_or_default() > PREVIEW_CACHE_MAX_AGE {
+                let _ = fs::remove_file(entry.path());
+                return None;
+            }
+            Some((modified, entry.path()))
         })
-    } else {
-        Err("The PDF has no renderable first page.".into())
+        .collect();
+    files.sort_by_key(|(modified, _)| *modified);
+    let remove_count = files.len().saturating_sub(PREVIEW_CACHE_MAX_FILES);
+    for (_, path) in files.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
     }
 }
+
+fn begin_preview_job(
+    state: &PreviewState,
+    request_id: u64,
+    prefetch: bool,
+) -> Result<Arc<AtomicBool>, String> {
+    let mut active = state
+        .active
+        .lock()
+        .map_err(|_| "Preview state is unavailable.")?;
+    if prefetch && active.is_some() {
+        return Err("Preview busy.".into());
+    }
+    if let Some(job) = active.take() {
+        job.cancelled.store(true, Ordering::Relaxed);
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    *active = Some(PreviewJob {
+        id: request_id,
+        cancelled: cancelled.clone(),
+    });
+    Ok(cancelled)
+}
+
+fn finish_preview_job(state: &PreviewState, request_id: u64) {
+    if let Ok(mut active) = state.active.lock() {
+        if active.as_ref().is_some_and(|job| job.id == request_id) {
+            *active = None;
+        }
+    }
+}
+
 #[tauri::command]
-fn get_pdf_preview(app: AppHandle, path: String) -> Result<String, String> {
-    let source = Path::new(&path);
-    validate_pdf_file(source)?;
-    let rendered = render_first_page(&app, source, 100.0)?;
-    let bytes = fs::read(&rendered.path).map_err(|e| e.to_string())?;
-    Ok(format!("data:image/png;base64,{}", BASE64.encode(bytes)))
+async fn get_pdf_preview(
+    app: AppHandle,
+    state: State<'_, PreviewState>,
+    path: String,
+    request_id: u64,
+    prefetch: bool,
+) -> Result<PreviewResponse, String> {
+    let source = PathBuf::from(path);
+    validate_pdf_file(&source)?;
+    if !prefetch {
+        if let Ok(mut active) = state.active.lock() {
+            if let Some(job) = active.take() {
+                job.cancelled.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    if !state.cache_pruned.swap(true, Ordering::Relaxed) {
+        prune_preview_cache(&app);
+    }
+    let cache_path = preview_cache_path(&app, &source)?;
+    if cache_path.is_file() {
+        return Ok(PreviewResponse {
+            path: cache_path.display().to_string(),
+            cache_hit: true,
+        });
+    }
+    let cancelled = begin_preview_job(&state, request_id, prefetch)?;
+    let app_for_render = app.clone();
+    let cache_for_render = cache_path.clone();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let rendered = render_first_page(
+            &app_for_render,
+            &source,
+            72.0,
+            Some(PREVIEW_RENDER_SIDE),
+            RenderFormat::Jpeg(PREVIEW_JPEG_QUALITY),
+            Some(&cancelled),
+        )?;
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("Preview cancelled.".into());
+        }
+        if !cache_for_render.is_file() {
+            fs::copy(&rendered.path, &cache_for_render).map_err(|e| e.to_string())?;
+        }
+        Ok(PreviewResponse {
+            path: cache_for_render.display().to_string(),
+            cache_hit: false,
+        })
+    })
+    .await;
+    finish_preview_job(&state, request_id);
+    task.map_err(|e| format!("Preview task failed: {e}"))?
+}
+
+#[tauri::command]
+fn cancel_pdf_preview(state: State<'_, PreviewState>, request_id: u64) {
+    if let Ok(active) = state.active.lock() {
+        if let Some(job) = active.as_ref().filter(|job| job.id == request_id) {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
 }
 fn converted_dimension(value: Option<f64>, unit: &str) -> Option<u32> {
     value
@@ -389,6 +597,37 @@ fn quality_value(quality: &str) -> u8 {
         _ => 85,
     }
 }
+
+fn custom_render_side(settings: &Settings) -> Option<u32> {
+    let (width, height) = (
+        converted_dimension(settings.width, &settings.unit),
+        converted_dimension(settings.height, &settings.unit),
+    );
+    let requested = width.into_iter().chain(height).max()?;
+    let multiplier = if settings.resize_mode == "crop" && width.is_some() && height.is_some() {
+        3.0
+    } else if width.is_some() && height.is_some() {
+        1.25
+    } else {
+        2.5
+    };
+    Some(
+        ((requested as f64 * multiplier).ceil() as u32)
+            .clamp(MIN_CUSTOM_RENDER_SIDE, MAX_RENDER_SIDE),
+    )
+}
+
+fn direct_render_format(settings: &Settings) -> Option<RenderFormat> {
+    if settings.width.is_some() || settings.height.is_some() {
+        return None;
+    }
+    match settings.format.as_str() {
+        "jpeg" | "jpg" => Some(RenderFormat::Jpeg(quality_value(&settings.quality))),
+        "png" => Some(RenderFormat::Png),
+        _ => None,
+    }
+}
+
 fn write_image(
     image: DynamicImage,
     output: &Path,
@@ -426,8 +665,66 @@ fn write_image(
         .map_err(|e| format!("Could not encode image: {e}"))?;
     fs::write(output, bytes.into_inner()).map_err(|e| e.to_string())
 }
-#[tauri::command]
-fn generate_covers(app: AppHandle, job: Job) -> Result<Summary, String> {
+
+fn write_reserved_output(
+    target_dir: &Path,
+    stem: &str,
+    extension: &str,
+    write: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    let destination = reserve_output(target_dir, stem, extension)?;
+    if let Err(error) = write(&destination) {
+        let _ = fs::remove_file(&destination);
+        return Err(error);
+    }
+    Ok(destination)
+}
+
+fn generate_one_cover(
+    app: &AppHandle,
+    source: &Path,
+    relative_dir: &Path,
+    output_root: &Path,
+    settings: &Settings,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    validate_pdf_file(source)?;
+    let target_dir = output_root.join(relative_dir);
+    fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+    let direct_format = direct_render_format(settings);
+    let render_side = custom_render_side(settings);
+    let rendered = render_first_page(
+        app,
+        source,
+        if render_side.is_none() {
+            DEFAULT_PPI
+        } else {
+            72.0
+        },
+        render_side,
+        direct_format.unwrap_or(RenderFormat::Png),
+        None,
+    )?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cover");
+    if direct_format.is_some() {
+        return write_reserved_output(&target_dir, stem, extension, |destination| {
+            fs::copy(&rendered.path, destination)
+                .map(|_| ())
+                .map_err(|e| format!("Could not save the cover image: {e}"))
+        });
+    }
+    let image =
+        image::open(&rendered.path).map_err(|e| format!("Could not read rendered page: {e}"))?;
+    let resized = resize_for_settings(image, settings);
+    write_reserved_output(&target_dir, stem, extension, |destination| {
+        write_image(resized, destination, &settings.format, &settings.quality)
+    })
+}
+
+fn generate_covers_blocking(app: AppHandle, job: Job) -> Result<Summary, String> {
     validate_settings(&job.settings)?;
     let files = gather_files(&job)?;
     if files.is_empty() {
@@ -441,70 +738,98 @@ fn generate_covers(app: AppHandle, job: Job) -> Result<Summary, String> {
     let output_root = PathBuf::from(&job.output_dir);
     fs::create_dir_all(&output_root).map_err(|e| e.to_string())?;
     let total = files.len();
-    let mut completed = Vec::new();
-    let mut failed = Vec::new();
     let extension = output_extension(&job.settings.format)?;
-    for (index, (source, relative_dir)) in files.into_iter().enumerate() {
-        let filename = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("PDF")
-            .to_string();
-        let _ = app.emit(
-            "conversion-progress",
-            Progress {
-                current: index + 1,
-                total,
-                file: filename,
-            },
-        );
-        let result = (|| -> Result<PathBuf, String> {
-            validate_pdf_file(&source)?;
-            let target_dir = output_root.join(relative_dir);
-            fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
-            let rendered = render_first_page(
-                &app,
-                &source,
-                if job.settings.width.is_some() || job.settings.height.is_some() {
-                    300.0
-                } else {
-                    DEFAULT_PPI
+    let worker_count = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_EXPORT_WORKERS)
+        .min(total)
+        .max(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from_iter(
+        files.into_iter().enumerate(),
+    )));
+    let (sender, receiver) = mpsc::channel();
+    let mut results = Vec::with_capacity(total);
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue = queue.clone();
+            let sender = sender.clone();
+            let app = app.clone();
+            let output_root = &output_root;
+            let settings = &job.settings;
+            scope.spawn(move || loop {
+                let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                let Some((index, (source, relative_dir))) = task else {
+                    break;
+                };
+                let result = generate_one_cover(
+                    &app,
+                    &source,
+                    &relative_dir,
+                    output_root,
+                    settings,
+                    extension,
+                );
+                if sender.send((index, source, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+        for current in 1..=total {
+            let Ok((index, source, result)) = receiver.recv() else {
+                break;
+            };
+            let filename = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("PDF")
+                .to_string();
+            let _ = app.emit(
+                "conversion-progress",
+                Progress {
+                    current,
+                    total,
+                    file: filename,
                 },
             );
-            let rendered = rendered?;
-            let image = image::open(&rendered.path)
-                .map_err(|e| format!("Could not read rendered page: {e}"))?;
-            let resized = resize_for_settings(image, &job.settings);
-            let stem = source
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("cover");
-            let destination = unique_output(&target_dir, stem, extension);
-            write_image(
-                resized,
-                &destination,
-                &job.settings.format,
-                &job.settings.quality,
-            )?;
-            Ok(destination)
-        })();
-        match result {
-            Ok(output) => completed.push(ItemResult {
-                source: source.display().to_string(),
-                output: Some(output.display().to_string()),
-                error: None,
-            }),
-            Err(error) => failed.push(ItemResult {
-                source: source.display().to_string(),
-                output: None,
-                error: Some(error),
-            }),
+            let item = match result {
+                Ok(output) => ItemResult {
+                    source: source.display().to_string(),
+                    output: Some(output.display().to_string()),
+                    error: None,
+                },
+                Err(error) => ItemResult {
+                    source: source.display().to_string(),
+                    output: None,
+                    error: Some(error),
+                },
+            };
+            results.push((index, item));
+        }
+    });
+    results.sort_by_key(|(index, _)| *index);
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+    for (_, result) in results {
+        if result.error.is_some() {
+            failed.push(result);
+        } else {
+            completed.push(result);
         }
     }
     Ok(Summary { completed, failed })
 }
+
+#[tauri::command]
+async fn generate_covers(app: AppHandle, job: Job) -> Result<Summary, String> {
+    tauri::async_runtime::spawn_blocking(move || generate_covers_blocking(app, job))
+        .await
+        .map_err(|error| format!("Cover generation task failed: {error}"))?
+}
 pub fn run() {
     tauri::Builder::default()
+        .manage(PreviewState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -512,6 +837,7 @@ pub fn run() {
             save_settings,
             list_pdfs_in_folder,
             get_pdf_preview,
+            cancel_pdf_preview,
             generate_covers
         ])
         .run(tauri::generate_context!())
@@ -564,9 +890,49 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("book.jpg"), []).unwrap();
         assert_eq!(
-            unique_output(&dir, "book", "jpg").file_name().unwrap(),
+            reserve_output(&dir, "book", "jpg")
+                .unwrap()
+                .file_name()
+                .unwrap(),
             "book-2.jpg"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn small_custom_outputs_use_a_small_render_budget() {
+        let settings = Settings {
+            width: Some(500.0),
+            height: Some(700.0),
+            ..Settings::default()
+        };
+        assert_eq!(custom_render_side(&settings), Some(875));
+    }
+
+    #[test]
+    fn crop_outputs_keep_extra_pixels_for_quality() {
+        let settings = Settings {
+            width: Some(500.0),
+            height: Some(500.0),
+            resize_mode: "crop".into(),
+            ..Settings::default()
+        };
+        assert_eq!(custom_render_side(&settings), Some(1_500));
+    }
+
+    #[test]
+    fn unscaled_jpeg_and_png_can_skip_reencoding() {
+        assert!(matches!(
+            direct_render_format(&Settings::default()),
+            Some(RenderFormat::Jpeg(85))
+        ));
+        let settings = Settings {
+            format: "png".into(),
+            ..Settings::default()
+        };
+        assert!(matches!(
+            direct_render_format(&settings),
+            Some(RenderFormat::Png)
+        ));
     }
 }

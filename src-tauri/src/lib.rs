@@ -18,8 +18,6 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const DEFAULT_PPI: f64 = 150.0;
-const MM_PPI: f64 = 72.0;
 const MAX_OUTPUT_DIMENSION: u32 = 10_000;
 const MAX_OUTPUT_PIXELS: u64 = 40_000_000;
 const MAX_RENDER_SECONDS: u64 = 90;
@@ -30,7 +28,8 @@ const PREVIEW_CACHE_VERSION: &str = "v1";
 const PREVIEW_CACHE_MAX_FILES: usize = 256;
 const PREVIEW_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const MAX_BATCH_FILES: usize = 10_000;
-const MAX_EXPORT_WORKERS: usize = 2;
+const MAX_STANDARD_EXPORT_WORKERS: usize = 2;
+const MAX_FAST_EXPORT_WORKERS: usize = 4;
 const MIN_CUSTOM_RENDER_SIDE: u32 = 256;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -42,6 +41,7 @@ struct Settings {
     width: Option<f64>,
     height: Option<f64>,
     ppi: u32,
+    resolution_version: u8,
     resize_mode: String,
     crop_anchor: String,
     quality: String,
@@ -53,7 +53,8 @@ impl Default for Settings {
             unit: "px".into(),
             width: None,
             height: None,
-            ppi: 150,
+            ppi: 72,
+            resolution_version: 1,
             resize_mode: "contain".into(),
             crop_anchor: "center".into(),
             quality: "high".into(),
@@ -113,16 +114,27 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("settings.json"))
 }
+fn parse_settings(bytes: &[u8]) -> Result<Settings, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let legacy_resolution = value.get("resolutionVersion").is_none();
+    let mut settings: Settings = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if legacy_resolution {
+        settings.ppi = 72;
+        settings.resolution_version = 1;
+    }
+    Ok(settings)
+}
 #[tauri::command]
 fn get_settings(app: AppHandle) -> Result<Settings, String> {
     let path = settings_path(&app)?;
     if !path.exists() {
         return Ok(Settings::default());
     }
-    serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    parse_settings(&fs::read(path).map_err(|e| e.to_string())?)
 }
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
+fn save_settings(app: AppHandle, mut settings: Settings) -> Result<(), String> {
+    settings.resolution_version = 1;
     fs::write(
         settings_path(&app)?,
         serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?,
@@ -258,6 +270,17 @@ fn renderer(app: &AppHandle) -> Result<PathBuf, String> {
             .into(),
     )
 }
+
+fn renderer_command(app: &AppHandle) -> Result<Command, String> {
+    let mut command = Command::new(renderer(app)?);
+    #[cfg(not(target_os = "windows"))]
+    if let Ok(cache_dir) = app.path().app_cache_dir() {
+        let _ = fs::create_dir_all(cache_dir.join("fontconfig"));
+        command.env("XDG_CACHE_HOME", cache_dir);
+    }
+    Ok(command)
+}
+
 struct RenderedPage {
     path: PathBuf,
     temp_dir: PathBuf,
@@ -285,8 +308,8 @@ fn render_first_page(
     fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
     let prefix = temp.join("page");
     let ppi = ppi.round().clamp(72.0, 300.0).to_string();
-    let mut command = Command::new(renderer(app)?);
-    command.args(["-f", "1", "-l", "1", "-singlefile"]);
+    let mut command = renderer_command(app)?;
+    command.args(["-q", "-f", "1", "-l", "1", "-singlefile"]);
     match format {
         RenderFormat::Png => {
             command.arg("-png");
@@ -498,13 +521,14 @@ fn cancel_pdf_preview(state: State<'_, PreviewState>, request_id: u64) {
         }
     }
 }
-fn converted_dimension(value: Option<f64>, unit: &str) -> Option<u32> {
+fn converted_dimension(value: Option<f64>, unit: &str, ppi: u32) -> Option<u32> {
+    let ppi = ppi as f64;
     value
         .map(|number| match unit {
-            "in" => number * MM_PPI,
-            "cm" => (number / 2.54) * MM_PPI,
-            "mm" => (number / 25.4) * MM_PPI,
-            "pt" => number,
+            "in" => number * ppi,
+            "cm" => (number / 2.54) * ppi,
+            "mm" => (number / 25.4) * ppi,
+            "pt" => (number / 72.0) * ppi,
             _ => number,
         })
         .filter(|number| number.is_finite() && *number > 0.0)
@@ -515,9 +539,12 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
     if !matches!(settings.unit.as_str(), "px" | "in" | "cm" | "mm" | "pt") {
         return Err("Unsupported size unit.".into());
     }
+    if !(36..=600).contains(&settings.ppi) {
+        return Err("Resolution must be between 36 and 600 PPI.".into());
+    }
     let (width, height) = (
-        converted_dimension(settings.width, &settings.unit),
-        converted_dimension(settings.height, &settings.unit),
+        converted_dimension(settings.width, &settings.unit, settings.ppi),
+        converted_dimension(settings.height, &settings.unit, settings.ppi),
     );
     if width
         .zip(height)
@@ -553,8 +580,8 @@ fn crop_to_size(image: DynamicImage, width: u32, height: u32, anchor: &str) -> D
 }
 fn resize_for_settings(image: DynamicImage, settings: &Settings) -> DynamicImage {
     let (w, h) = (
-        converted_dimension(settings.width, &settings.unit),
-        converted_dimension(settings.height, &settings.unit),
+        converted_dimension(settings.width, &settings.unit, settings.ppi),
+        converted_dimension(settings.height, &settings.unit, settings.ppi),
     );
     match settings.resize_mode.as_str() {
         "crop" if w.is_some() && h.is_some() => {
@@ -600,8 +627,8 @@ fn quality_value(quality: &str) -> u8 {
 
 fn custom_render_side(settings: &Settings) -> Option<u32> {
     let (width, height) = (
-        converted_dimension(settings.width, &settings.unit),
-        converted_dimension(settings.height, &settings.unit),
+        converted_dimension(settings.width, &settings.unit, settings.ppi),
+        converted_dimension(settings.height, &settings.unit, settings.ppi),
     );
     let requested = width.into_iter().chain(height).max()?;
     let multiplier = if settings.resize_mode == "crop" && width.is_some() && height.is_some() {
@@ -625,6 +652,18 @@ fn direct_render_format(settings: &Settings) -> Option<RenderFormat> {
         "jpeg" | "jpg" => Some(RenderFormat::Jpeg(quality_value(&settings.quality))),
         "png" => Some(RenderFormat::Png),
         _ => None,
+    }
+}
+
+fn export_worker_limit(settings: &Settings) -> usize {
+    if settings.ppi <= 96
+        && settings.width.is_none()
+        && settings.height.is_none()
+        && direct_render_format(settings).is_some()
+    {
+        MAX_FAST_EXPORT_WORKERS
+    } else {
+        MAX_STANDARD_EXPORT_WORKERS
     }
 }
 
@@ -697,7 +736,7 @@ fn generate_one_cover(
         app,
         source,
         if render_side.is_none() {
-            DEFAULT_PPI
+            settings.ppi as f64
         } else {
             72.0
         },
@@ -742,7 +781,7 @@ fn generate_covers_blocking(app: AppHandle, job: Job) -> Result<Summary, String>
     let worker_count = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
-        .min(MAX_EXPORT_WORKERS)
+        .min(export_worker_limit(&job.settings))
         .min(total)
         .max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from_iter(
@@ -855,11 +894,29 @@ mod tests {
     }
     #[test]
     fn physical_units_use_72_ppi() {
-        assert_eq!(converted_dimension(Some(1.0), "in"), Some(72));
-        assert_eq!(converted_dimension(Some(25.0), "mm"), Some(71));
-        assert_eq!(converted_dimension(Some(3.0), "cm"), Some(85));
-        assert_eq!(converted_dimension(Some(72.0), "pt"), Some(72));
-        assert_eq!(converted_dimension(Some(8.5), "in"), Some(612));
+        assert_eq!(converted_dimension(Some(1.0), "in", 72), Some(72));
+        assert_eq!(converted_dimension(Some(25.0), "mm", 72), Some(71));
+        assert_eq!(converted_dimension(Some(3.0), "cm", 72), Some(85));
+        assert_eq!(converted_dimension(Some(72.0), "pt", 72), Some(72));
+        assert_eq!(converted_dimension(Some(8.5), "in", 72), Some(612));
+    }
+    #[test]
+    fn physical_units_follow_selected_ppi() {
+        assert_eq!(converted_dimension(Some(1.0), "in", 300), Some(300));
+        assert_eq!(converted_dimension(Some(2.54), "cm", 300), Some(300));
+        assert_eq!(converted_dimension(Some(25.4), "mm", 300), Some(300));
+        assert_eq!(converted_dimension(Some(72.0), "pt", 300), Some(300));
+    }
+    #[test]
+    fn legacy_hidden_resolution_migrates_to_72_ppi() {
+        let settings = parse_settings(br#"{"ppi":150}"#).unwrap();
+        assert_eq!(settings.ppi, 72);
+        assert_eq!(settings.resolution_version, 1);
+    }
+    #[test]
+    fn explicitly_selected_resolution_is_preserved() {
+        let settings = parse_settings(br#"{"ppi":192,"resolutionVersion":1}"#).unwrap();
+        assert_eq!(settings.ppi, 192);
     }
     #[test]
     fn mm_is_converted_and_fitted() {
@@ -934,5 +991,19 @@ mod tests {
             direct_render_format(&settings),
             Some(RenderFormat::Png)
         ));
+    }
+    #[test]
+    fn lightweight_web_exports_allow_more_workers() {
+        assert_eq!(export_worker_limit(&Settings::default()), 4);
+        let high_resolution = Settings {
+            ppi: 300,
+            ..Settings::default()
+        };
+        assert_eq!(export_worker_limit(&high_resolution), 2);
+        let converted_format = Settings {
+            format: "webp".into(),
+            ..Settings::default()
+        };
+        assert_eq!(export_worker_limit(&converted_format), 2);
     }
 }

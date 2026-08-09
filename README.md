@@ -6,7 +6,7 @@ CoverDrop-macOS is a local Mac desktop app that turns the first page of one or m
 
 ## Download
 
-[Download CoverDrop 1.0.0 for Apple Silicon macOS](downloads/coverDrop_1.0.0.dmg)
+[Download CoverDrop 1.0.0 for Apple Silicon macOS](downloads/CoverDrop_macOS_1.0.0.dmg)
 
 You can also download it from the [CoverDrop 1.0.0 release](https://github.com/taidev/CoverDrop-macOS/releases/tag/v1.0.0). This build is ad-hoc signed but not Apple-notarized, so macOS may require you to Control-click the app and choose **Open** the first time. Intel Macs are not currently supported.
 

@@ -2,7 +2,7 @@
 
 CoverDrop is a local desktop app that turns the first page of one or more PDF files into website-ready cover images.
 
-![CoverDrop logo](public/coverdrop-logo-with-background.png)
+![CoverDrop desktop app showing a selected PDF, cover preview, and export settings](docs/coverdrop-screenshot.png)
 
 ## Features
 

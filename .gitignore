@@ -1,0 +1,21 @@
+# Dependencies and generated frontend output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Rust and Tauri build output
+src-tauri/target/
+
+# Platform renderer bundles are release inputs, not source files
+src-tauri/binaries/macos-*/
+src-tauri/binaries/windows-*/
+src-tauri/binaries/linux-*/
+
+# Local configuration and operating-system files
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Local continuation notes
+MEMORY.md

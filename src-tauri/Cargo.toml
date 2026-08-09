@@ -5,7 +5,7 @@ description = "Extract first PDF pages as cover images"
 authors = ["CoverDrop"]
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/taidev/coverdrop"
+repository = "https://github.com/taidev/CoverDrop-macOS"
 
 [lib]
 name = "pdf_cover_extractor_lib"

@@ -1,13 +1,13 @@
 {
-  "name": "pdf-cover-extractor",
+  "name": "coverdrop-macos",
   "private": true,
   "version": "1.0.0",
   "license": "GPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "https://github.com/taidev/coverdrop.git"
+    "url": "https://github.com/taidev/CoverDrop-macOS.git"
   },
-  "homepage": "https://github.com/taidev/coverdrop",
+  "homepage": "https://github.com/taidev/CoverDrop-macOS",
   "type": "module",
   "scripts": {
     "dev": "vite",
